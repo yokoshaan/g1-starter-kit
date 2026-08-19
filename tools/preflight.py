@@ -99,6 +99,12 @@ def check_link(iface):
            "     （`ip addr add` では NetworkManager に消されるので不可）")
         return False
 
+    if Path(f"/sys/class/net/{iface}/wireless").exists() or \
+       Path(f"/sys/class/net/{iface}/phy80211").exists():
+        warn("このインターフェースは無線です。読み取りは動きますが、受信レートや\n"
+             "     取りこぼしが有線より不安定になります。ロボットを動かす用途では\n"
+             "     有線を使ってください（docs/02-network.md の「なぜ有線か」）。")
+
     ok("リンク UP・静的IP あり")
     return True
 

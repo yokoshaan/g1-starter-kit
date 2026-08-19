@@ -10,5 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 load_config
+# 読み取り専用なので無線でも通す（不安定なら警告が出る）
+require_robot_link
 use_tv
 exec python3 "$REPO_DIR/tools/preflight.py" --iface "$G1_WIRED_IFACE" "$@"

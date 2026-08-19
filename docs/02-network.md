@@ -70,6 +70,66 @@ ip -br addr show enp0s31f6      # 192.168.123.222/24 と出れば OK
 
 有線リンク、静的 IP、サブネット内のホスト一覧、DDS の受信、機体の DoF まで見ます。ロボットは動きません。
 
+### なぜ有線なのか（無線でやらない理由）
+
+このキットは**ロボットを動かす用途（テレオペ / 腕の再生 / LiDAR）を有線必須**にしています。
+読み取り専用の確認（`preflight.sh`）は無線でも通しますが、警告を出します。
+
+技術的には無線でも DDS は動きます（CycloneDDS はインターフェースを問いません）。
+それでも有線にしているのは次の理由です。
+
+| 理由 | 内容 |
+|---|---|
+| **閉ループ制御** | 腕の指令は 50 Hz の閉ループです。遅延のばらつきとパケットロスが動作に直接出ます |
+| **止められる保証** | 中断・制御権の解放も同じ経路を通ります。切れたときに「止める指令」自体が届きません |
+| **ディスカバリ** | Unitree DDS はマルチキャストで相手を探します。アクセスポイントによる扱いの差が大きく、[IGMP snooping が適切でないと取りこぼします](https://discourse.openrobotics.org/t/ros2-wifi-multicast-multi-robot-and-igmp-snooping/28516)。Quest で遭遇するクライアント分離と同じ種類の問題です |
+| **LiDAR の帯域** | Mid-360 の仕様は [100BASE-TX のみ](https://livox-wiki-en.readthedocs.io/en/latest/tutorials/new_product/mid360/mid360.html)で無線の選択肢がありません。実測で **約 40 Mbps 連続**（300MB/分）必要です |
+| **公式系の設計** | [Weston Robot の G1 開発ガイド](https://docs.westonrobot.com/tutorial/unitree/g1_dev_guide/)では `192.168.123.1/24` 固定・DHCP なしで、RJ45 直結が推奨。WiFi はインターネット接続の手段としてのみ挙げられています |
+
+**参考になる前例**: [LeRobot の G1 サポート](https://huggingface.co/docs/lerobot/unitree_g1)は
+「有線 / **WiFi（実験的）** / ロボット上で直接」の 3 択を提示し、"Mind potential latency
+introduced by your network" と注意しています。ただし彼らの構成は**ロボット上でサーバを動かし**、
+速いループを機体内に閉じ込めたうえで、無線には上位のデータだけを流す形です。
+生の低レベル DDS 指令を無線で飛ばしているわけではありません。
+線を切りたい場合の正攻法は [07-next-steps.md](07-next-steps.md) を参照してください。
+
+### それでも無線で試す場合（実験・未検証）
+
+`config/g1.env` に次を書くとゲートを外せます。
+
+```bash
+G1_ALLOW_WIRELESS_CONTROL=true
+```
+
+⚠️ **このキットでは一度も検証していません。** 必ずロボットを吊り下げ等で支持し、
+人を近づけない状態で試してください。
+
+うまく動かない場合、原因はほぼマルチキャストディスカバリです。CycloneDDS を
+**ユニキャスト（peer 明示）**に切り替えると回避できることがあります。
+
+```bash
+cat > /tmp/cyclonedds-unicast.xml <<'XML'
+<CycloneDDS>
+  <Domain id="any">
+    <General>
+      <Interfaces><NetworkInterface name="wlp0s20f3"/></Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <!-- ロボットの制御演算ユニットを明示的に指定する -->
+      <Peers><Peer address="192.168.123.161"/></Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+XML
+export CYCLONEDDS_URI=file:///tmp/cyclonedds-unicast.xml
+```
+
+これは [ROS 2 コミュニティで無線時の定石](https://discourse.openrobotics.org/t/ros2-wifi-multicast-multi-robot-and-igmp-snooping/28516)
+とされている手法（マルチキャストをやめてユニキャストにする）を CycloneDDS に当てたものです。
+LiDAR は生 UDP なのでこの設定とは無関係で、帯域の問題も残ります。
+
 ---
 
 ## 2. WiFi（Quest 側）

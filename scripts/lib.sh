@@ -45,6 +45,7 @@ load_config() {
   : "${G1_HOST_IP:=}"
   : "${G1_ARM:=auto}"
   : "${G1_LIDAR_FLIP:=true}"
+  : "${G1_ALLOW_WIRELESS_CONTROL:=false}"
   : "${G1_WIFI_IFACE:=}"
   : "${ROS_DOMAIN_ID:=42}"
   export ROS_DOMAIN_ID
@@ -53,8 +54,14 @@ load_config() {
      \`ip -br addr\` で有線インターフェース名を確認して設定してください。"
 }
 
-# 有線が使える状態かを確認する（LiDAR / ロボット制御の前提）
-require_wired() {
+# インターフェースが無線かどうか
+iface_is_wireless() {
+  [ -d "/sys/class/net/$1/wireless" ] || [ -e "/sys/class/net/$1/phy80211" ]
+}
+
+# ロボットと同じサブネットに居るかだけを確認する（読み取り専用の用途向け）。
+# 無線でも通すが、値がばらつきうることは警告する。
+require_robot_link() {
   local state
   state="$(cat "/sys/class/net/$G1_WIRED_IFACE/operstate" 2>/dev/null || echo missing)"
   case "$state" in
@@ -70,6 +77,33 @@ require_wired() {
     _die "$G1_WIRED_IFACE に 192.168.123.x の IP が付いていません。
      現在: ${addr:-（アドレスなし）}
      docs/02-network.md の手順で固定 IP を設定してください。"
+  fi
+
+  if iface_is_wireless "$G1_WIRED_IFACE"; then
+    _warn "$G1_WIRED_IFACE は無線です。読み取りは動きますが、受信レートや
+     取りこぼしが有線より不安定になります（docs/02-network.md 参照）。"
+  fi
+}
+
+# ロボットを動かす用途の前提確認。読み取りに加えて、経路が有線であることを要求する。
+#
+# なぜ無線を拒否するか（docs/02-network.md に根拠と出典）:
+#   ・50Hz の閉ループ指令で遅延ジッタとロスが直接動作に出る
+#   ・中断・解放の指令も同じ経路を通るので、切れたときに止められる保証がない
+#   ・Unitree DDS はマルチキャストでディスカバリし、AP による扱いの差が大きい
+# どうしても試す場合は config/g1.env で G1_ALLOW_WIRELESS_CONTROL=true（実験扱い）。
+require_wired() {
+  require_robot_link
+  if iface_is_wireless "$G1_WIRED_IFACE"; then
+    if [ "$G1_ALLOW_WIRELESS_CONTROL" = "true" ]; then
+      _warn "無線経路でロボットを動かします（G1_ALLOW_WIRELESS_CONTROL=true）。
+     実験用の設定です。必ず吊り下げ等で支持し、人を近づけないでください。"
+    else
+      _die "$G1_WIRED_IFACE は無線です。ロボットを動かす用途では有線を使ってください。
+     理由は docs/02-network.md の「なぜ有線か」を参照してください。
+     どうしても試す場合は config/g1.env に次を書いてください（実験扱い）:
+       G1_ALLOW_WIRELESS_CONTROL=true"
+    fi
   fi
 }
 
