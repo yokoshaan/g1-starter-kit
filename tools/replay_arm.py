@@ -32,6 +32,7 @@
 import argparse
 import json
 import math
+import signal
 import sys
 import threading
 import time
@@ -81,6 +82,20 @@ KP_WRIST, KD_WRIST = 40.0, 1.5    # 手首
 WEAK_MOTORS = {4, 10, 15, 16, 17, 18, 22, 23, 24, 25}      # 足首ピッチ + 肩/肘
 WRIST_MOTORS = {19, 20, 21, 26, 27, 28}
 N_BODY_JOINTS = 29                # 0..28 が実関節。29 は arm_sdk の weight 用
+
+# 安全のための上限。ここを緩めるほど危険になる。
+# 1 フレーム間の関節角変化[rad]。実機で問題なく再生できた記録は 0.28 rad/frame
+# (30Hz で約 8 rad/s) 程度まで出るので、そこは通す。桁が違う値だけを弾く。
+WARN_STEP_RAD = 0.35      # これを超えたら警告（人の操作でも稀に出る）
+MAX_STEP_RAD = 1.0        # これを超えたら拒否（30Hz で 30 rad/s。記録の破損とみなす）
+STALE_STATE_SEC = 0.3     # lowstate がこの秒数途切れたら異常として停止
+ARG_RANGES = {            # 引数名: (下限, 上限)
+    "frequency": (1.0, 200.0),
+    "approach": (0.5, 60.0),
+    "weight_ramp": (0.2, 30.0),
+    "kp": (1.0, 200.0),
+    "kd": (0.0, 20.0),
+}
 
 
 # ---- 記録の読み込み ------------------------------------------------------------
@@ -165,6 +180,48 @@ def infer_dof(left, right, forced=None):
     return traj, joints, dof, overlap_err
 
 
+def validate_trajectory(traj, fps):
+    """軌道に NaN/inf や急激な飛びが無いかを確認する。
+
+    位置リミットのクリップだけでは安全にならない。1 フレームで可動域いっぱいを
+    移動する指令は、クリップを通ってしまうが実機では危険な急動作になる。
+    記録の破損や IK の不連続を、送信前にここで弾く。
+    """
+    if not np.isfinite(traj).all():
+        bad = int((~np.isfinite(traj)).sum())
+        sys.exit(f"エラー: 軌道に NaN/inf が {bad} 個あります。記録が壊れています。")
+
+    if len(traj) < 2:
+        return
+    steps = np.abs(np.diff(traj, axis=0))
+    worst = float(steps.max())
+    idx = int(np.unravel_index(steps.argmax(), steps.shape)[0])
+
+    if worst > MAX_STEP_RAD:
+        sys.exit(
+            f"エラー: 記録に異常な飛びがあります（frame {idx}→{idx+1} で {worst:.3f} rad）\n"
+            f"  {fps:.0f} Hz なら約 {worst * fps:.0f} rad/s に相当し、実機では出ない値です。\n"
+            "  記録が壊れている可能性が高いので、実機では再生しません。\n"
+            "  --source states / actions を切り替えるか、記録を録り直してください。")
+
+    if worst > WARN_STEP_RAD:
+        print(f"  ⚠️ 最大の飛びが {worst:.3f} rad/frame "
+              f"（frame {idx}→{idx+1}、約 {worst * fps:.1f} rad/s）あります。\n"
+              "     人の操作でも起こりますが、再生時に速い動きになります。"
+              "実機では最初の動きを見ながら、危なければ Enter で中断してください。\n")
+
+
+def validate_args(args):
+    """数値引数が有限かつ安全な範囲かを確認する。"""
+    for name, (lo, hi) in ARG_RANGES.items():
+        v = getattr(args, name, None)
+        if v is None:
+            continue
+        if not math.isfinite(v) or not (lo <= v <= hi):
+            sys.exit(f"エラー: --{name.replace('_', '-')} の値 {v} は許容範囲外です"
+                     f"（{lo} 〜 {hi}）。")
+
+
 # ---- 表示 ----------------------------------------------------------------------
 
 def summarize(traj, joints, dof, fps, overlap_err, source):
@@ -242,7 +299,10 @@ class ArmReplayer:
         self.gains_overridden = gains_overridden
         self.crc = CRC()
         self.low_state = None
+        self.last_state_at = None    # time.monotonic()。通信断の検出に使う
         self.abort = threading.Event()
+        self.abort_reason = ""
+        self.started_sending = False
 
         # ChannelFactoryInitialize は main() で先に済ませてある
         self.cmd = unitree_hg_msg_dds__LowCmd_()
@@ -306,14 +366,61 @@ class ArmReplayer:
 
     def _on_state(self, msg):
         self.low_state = msg
+        self.last_state_at = time.monotonic()
+
+    def state_is_stale(self):
+        """lowstate が途切れていないか。途切れたまま送信を続けると危険。"""
+        if self.last_state_at is None:
+            return True
+        return (time.monotonic() - self.last_state_at) > STALE_STATE_SEC
+
+    def check_alive(self):
+        """通信が生きているかを確認し、切れていれば停止を要求する。"""
+        if self.state_is_stale():
+            self.abort.set()
+            self.abort_reason = (
+                f"ロボットの状態（rt/lowstate）が {STALE_STATE_SEC} 秒以上途切れました。"
+                "ケーブル断・ロボット停止の可能性があります")
+            return False
+        return True
 
     def wait_for_state(self, timeout=5.0):
-        deadline = time.time() + timeout
-        while self.low_state is None and time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while self.low_state is None and time.monotonic() < deadline:
             time.sleep(0.05)
         if self.low_state is None:
             sys.exit("エラー: rt/lowstate を受信できません。"
                      "ネットワークインターフェース名とロボットの起動を確認してください。")
+
+    def verify_robot_dof(self, expected_dof):
+        """実機のモータ構成を読み、記録の DoF と一致するか確認する。
+
+        記録側の構造だけで判定していると、23DoF 機に 29DoF の記録を流したときに
+        右腕の値が別関節へずれて送られる。送信前にここで必ず弾く。
+        """
+        def live(idx):
+            m = self.low_state.motor_state[idx]
+            return m.vol > 0.1 or m.temperature[0] > 0
+
+        n_left = sum(live(j) for j in (15, 16, 17, 18, 19, 20, 21))
+        n_right = sum(live(j) for j in (22, 23, 24, 25, 26, 27, 28))
+        if n_left == n_right == 7:
+            actual = 29
+        elif n_left == n_right == 5:
+            actual = 23
+        else:
+            sys.exit(
+                f"エラー: 実機のモータ構成を判定できません（腕 {n_left}+{n_right} 軸）。\n"
+                "  ロボットの電源とモータの有効化を確認してください。\n"
+                "  判定できない状態では実機に送信しません。")
+
+        if actual != expected_dof:
+            sys.exit(
+                f"エラー: 記録は {expected_dof}DoF 機のものですが、"
+                f"接続中の実機は {actual}DoF 機です（腕 {n_left}+{n_right} 軸）。\n"
+                "  そのまま送ると右腕の値が別の関節へずれて送られ、危険です。\n"
+                f"  この実機で記録したデータを使うか、{actual}DoF 機に繋いでください。")
+        print(f"  実機の構成を確認: {actual}DoF（腕 {n_left}+{n_right} 軸）— 記録と一致")
 
     def current_q(self, joints):
         return np.array([self.low_state.motor_state[j].q for j in joints], dtype=np.float64)
@@ -322,6 +429,7 @@ class ArmReplayer:
         """1 フレーム分の指令を送る。targets は self.joints と同じ並び。"""
         if not self._header_ready:
             self._prepare_header()
+        self.started_sending = True
         # 制御権 weight は arm_sdk 方式でのみ意味を持つ
         if self.topic == "rt/arm_sdk":
             self.cmd.motor_cmd[WEIGHT_JOINT].q = float(np.clip(weight, 0.0, 1.0))
@@ -347,8 +455,9 @@ class ArmReplayer:
         """seconds 秒かけて fn(ratio) を 50Hz で送る。中断されたら False を返す。"""
         steps = max(1, int(seconds / CONTROL_DT))
         for i in range(steps + 1):
-            if self.abort.is_set():
-                print(f"\n  中断（{label} の途中）")
+            if not self.check_alive() or self.abort.is_set():
+                print(f"\n  中断（{label} の途中）"
+                      + (f": {self.abort_reason}" if self.abort_reason else ""))
                 return False
             fn(i / steps)
             time.sleep(CONTROL_DT)
@@ -366,13 +475,13 @@ class ArmReplayer:
         self.last_target = start_q.copy()
 
         # [1] 制御権を 0→1 にゆっくり渡す（姿勢は現在のまま）
-        print(f"  [1/5] 制御権を取得 ({weight_ramp:.1f} 秒)")
+        print(f"  [1/6] 制御権を取得 ({weight_ramp:.1f} 秒)")
         if not self._ramp(weight_ramp,
                           lambda r: self._send(r, start_q, waist_hold), "制御権取得"):
             return self._release(waist_hold, weight_ramp)
 
         # [2] 現在姿勢 → 記録の初期姿勢へ線形補間
-        print(f"  [2/5] 記録の初期姿勢へ移行 ({approach:.1f} 秒)")
+        print(f"  [2/6] 記録の初期姿勢へ移行 ({approach:.1f} 秒)")
 
         def to_first(r):
             self.last_target = (1 - r) * start_q + r * traj[0]
@@ -383,13 +492,16 @@ class ArmReplayer:
 
         # [3] 記録軌道の再生（経過時間で補間サンプリング）
         duration = (len(traj) - 1) / fps
-        print(f"  [3/5] 再生 ({duration:.1f} 秒 / {len(traj)} フレーム)")
-        t0 = time.time()
+        print(f"  [3/6] 再生 ({duration:.1f} 秒 / {len(traj)} フレーム)")
+        # 実時間ではなく monotonic を使う（NTP 調整やサスペンドで時計が飛ぶと
+        # 軌道が一気に進んで急動作になるため）
+        t0 = time.monotonic()
         while True:
-            if self.abort.is_set():
-                print("\n  中断（再生中）")
+            if not self.check_alive() or self.abort.is_set():
+                print("\n  中断（再生中）"
+                      + (f": {self.abort_reason}" if self.abort_reason else ""))
                 return self._release(waist_hold, weight_ramp)
-            t = time.time() - t0
+            t = time.monotonic() - t0
             if t >= duration:
                 break
             pos = t * fps
@@ -402,7 +514,7 @@ class ArmReplayer:
         print()
 
         # [4] 記録の初期姿勢へ戻す
-        print("  [4/5] 初期姿勢へ復帰 (3.0 秒)")
+        print("  [4/6] 初期姿勢へ復帰 (3.0 秒)")
         end_q = self.last_target.copy()
 
         def back(r):
@@ -413,16 +525,59 @@ class ArmReplayer:
         return self._release(waist_hold, weight_ramp)
 
     def _release(self, waist_hold, seconds):
-        """現在の指令姿勢をホールドしたまま制御権を返す（脱力させない）。"""
-        # run() に入る前に中断されると last_target が未設定なので、その場合は実測値を使う
+        """指令を実測姿勢へ寄せてから送信を終える。
+
+        単に最後の目標値を保持し続けると、追従遅れがあるぶん実測姿勢との差が
+        残ったまま高ゲインで引っ張り続けることになる。そこで、まず実測角へ
+        ゆっくり寄せて力を抜き、それから終了する。
+
+        ⚠️ rt/arm_sdk では weight を 1→0 に落として制御権をロボット側へ返せる。
+           rt/lowcmd には返却の仕組みが無く、**送信を止めるだけ**である。
+           停止後の挙動はロボット側の watchdog に依存し、このスクリプトからは
+           保証できない。ロボットは支持された状態で使うこと。
+        """
+        if not self.started_sending:
+            print("  （まだ何も送信していないため、終了処理は不要です）")
+            return True
+
         hold = (self.last_target.copy() if getattr(self, "last_target", None) is not None
-                else self.current_q(self.joints))
-        print(f"  [5/5] 制御権を返却 ({seconds:.1f} 秒・姿勢はホールド)")
-        steps = max(1, int(seconds / CONTROL_DT))
-        for i in range(steps + 1):
-            self._send(1.0 - i / steps, hold, waist_hold)
-            time.sleep(CONTROL_DT)
-        print("  完了。")
+                else None)
+
+        # 実測角が取れるなら、そこへ寄せて力を抜く
+        if not self.state_is_stale():
+            measured = self.current_q(self.joints)
+            if hold is None:
+                hold = measured
+            else:
+                print("  [5/6] 指令を実測姿勢へ寄せる (1.0 秒)")
+                start = hold.copy()
+                steps = max(1, int(1.0 / CONTROL_DT))
+                for i in range(steps + 1):
+                    target = start + (measured - start) * (i / steps)
+                    self._send(1.0, target, waist_hold)
+                    time.sleep(CONTROL_DT)
+                hold = measured
+        elif hold is None:
+            print("  ⚠️ 実測姿勢が取得できず、送信済みの目標値も無いため終了処理を省きます。")
+            return False
+
+        if self.topic == "rt/arm_sdk":
+            print(f"  [6/6] 制御権を返却 ({seconds:.1f} 秒・姿勢はホールド)")
+            steps = max(1, int(seconds / CONTROL_DT))
+            for i in range(steps + 1):
+                self._send(1.0 - i / steps, hold, waist_hold)
+                time.sleep(CONTROL_DT)
+            print("  完了（制御権をロボット側へ返しました）。")
+        else:
+            # rt/lowcmd に「返却」は無い。姿勢を保ったまま送信を止める。
+            print(f"  [6/6] 姿勢を保持して送信終了 ({seconds:.1f} 秒)")
+            steps = max(1, int(seconds / CONTROL_DT))
+            for i in range(steps + 1):
+                self._send(1.0, hold, waist_hold)
+                time.sleep(CONTROL_DT)
+            print("  送信を終了しました。")
+            print("  ⚠️ rt/lowcmd には制御権の返却手順がありません。停止後の挙動は")
+            print("     ロボット側の watchdog に依存します（このキットでは未検証）。")
         return True
 
 
@@ -433,24 +588,46 @@ def detect_control_topic(iface):
     arm_sdk は効かない（制御権を渡す相手がいない）ので rt/lowcmd を使う。
     これを間違えると「再生成功と表示されるのに腕が動かない」状態になる。
     """
-    try:
-        from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
-            MotionSwitcherClient)
-    except ImportError:
-        return "rt/arm_sdk", "モード照会モジュールが無いため既定を使用"
-
-    try:
-        msc = MotionSwitcherClient()
-        msc.SetTimeout(5.0)
-        msc.Init()
-        code, result = msc.CheckMode()
-    except Exception as e:
-        return "rt/arm_sdk", f"モード照会に失敗（{type(e).__name__}）のため既定を使用"
-
-    name = (result or {}).get("name", "") if isinstance(result, dict) else ""
+    name = current_motion_mode()
     if name:
         return "rt/arm_sdk", f"モーションコントローラ '{name}' が動作中"
     return "rt/lowcmd", "モーションコントローラが停止（デバッグ状態）= arm_sdk は効かない"
+
+
+def require_motion_stopped(topic, force):
+    """rt/lowcmd を使う前に、モーションコントローラが止まっていることを確認する。
+
+    Unitree の手順では低レベル制御の前に高レベルのモーションサービスを止める。
+    動いたまま lowcmd を送ると 2 つの制御が同じモータを取り合うことになる。
+    """
+    if topic != "rt/lowcmd":
+        return
+    name = current_motion_mode()
+    if not name:
+        return
+    if force:
+        print(f"  ⚠️ モーションコントローラ '{name}' が動作中ですが "
+              "--force-lowcmd が指定されたため続行します（非推奨）。")
+        return
+    sys.exit(
+        f"エラー: モーションコントローラ '{name}' が動作中です。\n"
+        "  この状態で rt/lowcmd を送ると、ロボット側の制御と指令が競合します。\n"
+        "  リモコンでモーション制御を停止してから実行してください。\n"
+        "  （腕だけ動かしたいなら --topic rt/arm_sdk が本来の経路です）")
+
+
+def current_motion_mode():
+    """稼働中のモーションコントローラ名を返す。停止中や照会失敗時は空文字。"""
+    try:
+        from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
+            MotionSwitcherClient)
+        msc = MotionSwitcherClient()
+        msc.SetTimeout(5.0)
+        msc.Init()
+        _, result = msc.CheckMode()
+    except Exception:
+        return ""
+    return (result or {}).get("name", "") if isinstance(result, dict) else ""
 
 
 def watch_for_enter(replayer):
@@ -480,22 +657,27 @@ def main():
     p.add_argument("--weight-ramp", type=float, default=2.0, help="制御権ランプ秒数")
     p.add_argument("--approach", type=float, default=4.0, help="初期姿勢への移行秒数")
     p.add_argument("--waist", choices=["hold", "none"], default="hold",
-                   help="hold=腰を現在角で保持（既定） / none=腰に一切書き込まない")
+                   help="hold=腰を現在角で保持（既定） / "
+                        "none=腰に書き込まない。rt/arm_sdk では腰の剛性が無くなる場合がある")
     p.add_argument("--topic", choices=["auto", "rt/arm_sdk", "rt/lowcmd"], default="auto",
                    help="指令トピック。auto（既定）は実機に問い合わせて選ぶ。"
                         "rt/arm_sdk はモーションコントローラ稼働時のみ有効。"
                         "rt/lowcmd は全身の低レベル指令（腕以外は現在角度でロックする）")
+    p.add_argument("--force-lowcmd", action="store_true",
+                   help="⚠️ モーションコントローラ稼働中でも rt/lowcmd を送る（非推奨）")
     p.add_argument("--kp", type=float, default=DEFAULT_KP)
     p.add_argument("--kd", type=float, default=DEFAULT_KD)
     p.add_argument("--no-plot", action="store_true", help="dry-run でプロットを出さない")
     p.add_argument("--save-plot", default=None, help="dry-run のプロットを PNG 保存（画面不要）")
     args = p.parse_args()
 
+    validate_args(args)
     left, right, rec_fps = load_episode(args.episode, args.source)
     traj, joints, dof, overlap_err = infer_dof(left, right, args.dof)
     fps = args.frequency or rec_fps
 
     summarize(traj, joints, dof, fps, overlap_err, args.source)
+    validate_trajectory(traj, fps)
 
     if args.dry_run:
         print("=" * 62)
@@ -531,6 +713,8 @@ def main():
     if topic == "auto":
         topic, reason = detect_control_topic(args.network_interface)
 
+    require_motion_stopped(topic, args.force_lowcmd)
+
     print("=" * 62)
     print(" ⚠️  実機送信モード")
     print("=" * 62)
@@ -543,6 +727,10 @@ def main():
         print(f"  ゲイン           : kp={args.kp} kd={args.kd}")
     print(f"  対象関節         : 腕 {len(joints)} 関節のみ（脚・ハンドには書き込みません）")
     print(f"  腰               : {args.waist}")
+    if args.waist == "none" and topic == "rt/arm_sdk":
+        print("  ⚠️ --waist none と rt/arm_sdk の組み合わせでは、腰の指令が")
+        print("     kp=0/kd=0 のまま送られ、腰の剛性が失われる場合があります。")
+        print("     ロボットが支持されていない場合は --waist hold（既定）を使ってください。")
     print("  ロボットの腕の可動範囲に人・物が無いことを確認してください。")
     print("  中断は Enter または Ctrl+C（姿勢をホールドしたまま制御権を返します）。")
     if input("\n  実行しますか? [y/N] ").strip().lower() != "y":
@@ -553,15 +741,46 @@ def main():
     gains_overridden = (args.kp != DEFAULT_KP) or (args.kd != DEFAULT_KD)
     replayer = ArmReplayer(args.network_interface, joints, waist_joints,
                            args.kp, args.kd, topic, gains_overridden)
+
+    # Ctrl+C 以外（SIGTERM・端末切断）でも必ず終了処理を通す。
+    # ここを外すと、送信途中でプロセスが消えて腕が指令のまま取り残される。
+    def on_signal(signum, _frame):
+        replayer.abort.set()
+        replayer.abort_reason = f"シグナル {signal.Signals(signum).name} を受信"
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, on_signal)
+        except (ValueError, OSError):
+            pass
+
     threading.Thread(target=watch_for_enter, args=(replayer,), daemon=True).start()
+
     try:
+        replayer.wait_for_state()
+        replayer.verify_robot_dof(dof)
         replayer.run(traj, fps, args.weight_ramp, args.approach, args.waist)
     except KeyboardInterrupt:
         replayer.abort.set()
-        time.sleep(0.2)
-        print("\n  Ctrl+C を受け取りました。制御権を返却します。")
-        replayer._release(replayer.current_q(waist_joints) if args.waist == "hold" else None,
-                          args.weight_ramp)
+        replayer.abort_reason = "Ctrl+C を受信"
+    except BaseException as e:
+        replayer.abort.set()
+        replayer.abort_reason = f"{type(e).__name__}: {e}"
+        print(f"\n  ⚠️ 予期しないエラー: {type(e).__name__}: {e}")
+        raise
+    finally:
+        # 例外・シグナル・正常終了のいずれでも安全側の終了処理を試みる。
+        # 終了処理中の 2 回目の割り込みで抜けないよう、ここでは例外を潰す。
+        if replayer.started_sending:
+            try:
+                waist_hold = (replayer.current_q(waist_joints)
+                              if args.waist == "hold" and not replayer.state_is_stale()
+                              else None)
+                replayer._release(waist_hold, args.weight_ramp)
+            except BaseException as e:
+                print(f"  ⚠️ 終了処理に失敗しました（{type(e).__name__}）。"
+                      "ロボットの状態を目視で確認してください。")
+        if replayer.abort_reason:
+            print(f"  中断理由: {replayer.abort_reason}")
 
 
 if __name__ == "__main__":

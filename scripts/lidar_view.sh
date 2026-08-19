@@ -49,11 +49,14 @@ cleanup() {
   trap - INT TERM EXIT
   echo ""
   echo "終了処理中..."
+  # プロセスグループ→単体PID の順に試す（setsid が失敗した子にも届かせる）
   for pid in "${PIDS[@]}"; do
     kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   done
   sleep 1
-  for pid in "${PIDS[@]}"; do kill -KILL "-$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]}"; do
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  done
   echo "停止しました。"
 }
 trap cleanup INT TERM EXIT
@@ -117,4 +120,14 @@ fi
 echo ""
 echo "起動しました。Ctrl+C で全部止まります。"
 echo "  記録する場合は別ターミナルで: ./scripts/record_bag.sh <名前>"
-wait
+
+# 単に wait すると、点群を出す本体が死んでも RViz だけ残って
+# 「起動しました」の表示のまま気づけない。本体を個別に監視する。
+MAIN_PID="${PIDS[0]}"
+while kill -0 "$MAIN_PID" 2>/dev/null; do
+  sleep 1
+done
+echo ""
+echo "⚠️ 点群の配信プロセスが終了しました。表示も終了します。"
+echo "   原因は上のログを確認してください（設定の機種違いが最も多いです）。"
+exit 1

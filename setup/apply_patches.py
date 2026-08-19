@@ -32,52 +32,57 @@ from pathlib import Path
 
 TELEOP = Path.home() / "xr_teleoperate" / "teleop"
 
-# 各パッチは (ファイル, [(適用前, 適用後), ...]) の形。
-# 適用前が見つからず適用後が既にあれば「適用済み」と判断する。
+# 各エントリは末尾に marker（適用済みを判断する固有の目印）を持つ。
+#   scoped: (クラスのアンカー, 適用前, 適用後, marker)  … そのクラス内の 1 件だけ
+#   plain : (適用前, 適用後, marker)                    … ファイル全体で全件
+# marker を置換ごとに分けているのは、複数置換のうち一部だけ適用された状態を
+# 「適用済み」と誤判定しないため。
 PATCHES = {
     "safe-startup": {
         "desc": "起動時の腕の速度を 20 → 2 rad/s に落とす（安全）",
         "file": "robot_control/robot_arm.py",
         # __init__ 内の 1 箇所だけを狙う。speed_gradual_max() 側の同名代入は触らない。
-        # marker: 適用済みかどうかを判断する短い目印。コメント文の差で誤判定しないため。
-        "marker": "self.arm_velocity_limit = 2.0",
         "scoped": [
             ("class G1_29_ArmController",
              "        self.all_motor_q = None\n        self.arm_velocity_limit = 20.0",
              "        self.all_motor_q = None\n"
              "        # PATCH(safe-startup): 起動直後にゼロ姿勢へ飛ぶ速度。元は 20.0。\n"
              "        # 追従開始後は speed_gradual_max() が 20→30 に上げ直すので操作感は変わらない。\n"
-             "        self.arm_velocity_limit = 2.0"),
+             "        self.arm_velocity_limit = 2.0",
+             "self.arm_velocity_limit = 2.0"),
             ("class G1_23_ArmController",
              "        self.all_motor_q = None\n        self.arm_velocity_limit = 20.0",
              "        self.all_motor_q = None\n"
              "        # PATCH(safe-startup): 起動直後にゼロ姿勢へ飛ぶ速度。元は 20.0。\n"
              "        # 追従開始後は speed_gradual_max() が 20→30 に上げ直すので操作感は変わらない。\n"
-             "        self.arm_velocity_limit = 2.0"),
+             "        self.arm_velocity_limit = 2.0",
+             "self.arm_velocity_limit = 2.0"),
         ],
     },
     "head-reference": {
         "desc": "腕の制御基準を head_yaw → head_position（よそを向いてもズレない）",
         "file": "teleop_hand_and_arm.py",
-        "marker": 'arm_reference_mode="head_position"',
         "plain": [
             ('arm_reference_mode="head_yaw"',
              '# PATCH(head-reference): 元は "head_yaw"。頭の向きで腕の前後左右が回ってしまい、\n'
              '                                     # 操作中によそを向くと左右がズレるため位置基準にする。\n'
-             '                                     arm_reference_mode="head_position"'),
+             '                                     arm_reference_mode="head_position"',
+             'arm_reference_mode="head_position"'),
         ],
     },
     "record-camera": {
         "desc": "カメラが無い環境でも記録できるようにする（記録開始で落ちるのを防ぐ）",
         "file": "teleop_hand_and_arm.py",
-        "marker": "head_img.bgr is not None",
         "plain": [
             ("if head_img is not None:",
-             "if head_img is not None and head_img.bgr is not None:"),
+             "if head_img is not None and head_img.bgr is not None:",
+             "head_img.bgr is not None"),
             ("if left_wrist_img is not None:",
-             "if left_wrist_img is not None and left_wrist_img.bgr is not None:"),
+             "if left_wrist_img is not None and left_wrist_img.bgr is not None:",
+             "left_wrist_img.bgr is not None"),
             ("if right_wrist_img is not None:",
-             "if right_wrist_img is not None and right_wrist_img.bgr is not None:"),
+             "if right_wrist_img is not None and right_wrist_img.bgr is not None:",
+             "right_wrist_img.bgr is not None"),
         ],
     },
 }
@@ -87,7 +92,7 @@ def load(path):
     if not path.exists():
         sys.exit(f"エラー: {path} がありません。\n"
                  "  xr_teleoperate が導入されていないようです。"
-                 "setup/install_base.sh を先に実行してください。")
+                 "setup/install_env.sh を先に実行してください。")
     return path.read_text(encoding="utf-8")
 
 
@@ -130,12 +135,10 @@ def run(names, dry_run, revert):
         path = TELEOP / spec["file"]
         text = changed_files.get(path, load(path))
 
-        marker = spec.get("marker", "")
-        for entry in spec.get("scoped", []):
-            anchor, before, after = entry
+        for anchor, before, after, marker in spec.get("scoped", []):
             text, status = apply_scoped(text, anchor, before, after, revert, marker)
             results.append((name, f"{spec['file']} [{anchor.split()[-1]}]", status))
-        for before, after in spec.get("plain", []):
+        for before, after, marker in spec.get("plain", []):
             text, status = apply_plain(text, before, after, revert, marker)
             label = before.split("(")[0][:44]
             results.append((name, f"{spec['file']} [{label}]", status))
@@ -159,20 +162,28 @@ def run(names, dry_run, revert):
 
     if dry_run:
         print("\n  --dry-run なのでファイルは変更していません。")
-        return 0
+        return 1 if ng else 0
+
+    # 一部だけ当たった中途半端な状態を残さない。全部通ったときだけ書き込む。
+    if ng:
+        print(f"\n  ⚠️ {ng} 件が当たらなかったため、**何も変更していません**。")
+        print("     xr_teleoperate のバージョンが想定と違う可能性があります。")
+        print("     手元の版に合わせて setup/apply_patches.py の対象文字列を見直してください。")
+        return 1
 
     for path, text in changed_files.items():
         backup = path.with_suffix(path.suffix + ".orig")
         if not revert and not backup.exists():
             backup.write_text(load(path), encoding="utf-8")
             print(f"\n  バックアップ: {backup}")
-        path.write_text(text, encoding="utf-8")
+        # 同一ディレクトリの一時ファイルに書いてから置き換える（途中で切れても壊れない）
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
         print(f"  更新: {path}")
 
-    if ng:
-        print(f"\n  ⚠️ {ng} 件が当たりませんでした。xr_teleoperate のバージョンを確認してください。")
     print("\n  完了。")
-    return 1 if ng else 0
+    return 0
 
 
 def main():

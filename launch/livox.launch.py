@@ -3,10 +3,10 @@
 ドライバ同梱の launch は引数を持たず、切り替えのたびにファイル編集が要るため、
 必要なものを launch 引数として外に出したもの。通常は ./scripts/lidar_view.sh 経由で使う。
 
-    ros2 launch g1_livox.launch.py                  # 通常（PointCloud2）
-    ros2 launch g1_livox.launch.py xfer_format:=1   # SLAM 用（Livox CustomMsg）
-    ros2 launch g1_livox.launch.py rviz:=false      # 記録だけしたいとき
-    ros2 launch g1_livox.launch.py flip:=false      # 上下反転をやめる
+    ros2 launch livox.launch.py                  # 通常（PointCloud2）
+    ros2 launch livox.launch.py xfer_format:=1   # SLAM 用（Livox CustomMsg）
+    ros2 launch livox.launch.py rviz:=false      # 記録だけしたいとき
+    ros2 launch livox.launch.py flip:=false      # 上下反転をやめる
 
 トピック: /livox/lidar (PointCloud2), /livox/imu (sensor_msgs/Imu)
 フレーム: livox_frame（センサ）, viz_base（表示用の親。下記参照）
@@ -17,7 +17,7 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 # このファイルは <repo>/launch/ に置かれている前提
@@ -73,14 +73,20 @@ def generate_launch_description():
 
     # 表示用の親フレーム。点群と IMU は livox_frame 内で整合しているので、
     # ここでは「見た目を正立させる」だけに使う。SLAM 側の外部パラメータは触らない。
+    #
+    # flip=false でも TF 自体は必ず publish する（roll=0 の恒等変換にする）。
+    # RViz の Fixed Frame が viz_base 固定なので、publish を止めてしまうと
+    # 正立搭載の環境では点群がまったく表示されなくなる。
     flip_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
         name="viz_base_to_livox",
         output="log",
-        condition=IfCondition(LaunchConfiguration("flip")),
         arguments=["--x", "0", "--y", "0", "--z", "0",
-                   "--roll", flip_roll, "--pitch", "0", "--yaw", "0",
+                   "--roll", PythonExpression(
+                       ["'", flip_roll, "' if '", LaunchConfiguration("flip"),
+                        "'.lower() in ('true', '1') else '0.0'"]),
+                   "--pitch", "0", "--yaw", "0",
                    "--frame-id", "viz_base", "--child-frame-id", "livox_frame"],
     )
 

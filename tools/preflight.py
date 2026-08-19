@@ -9,7 +9,7 @@
     python3 tools/preflight.py --iface enp0s31f6
 
     --iface     有線インターフェース名（既定: config/g1.env の G1_WIRED_IFACE）
-    --subnet    スキャンするサブネット /24 (default: 192.168.123)
+    --subnet    スキャンする /24（既定: 有線 NIC の実 IP から導出）
     --duration  DDS 受信サンプリング秒数 (default: 3.0)
     --skip-scan ping スイープを省略して DDS だけ見る
     --print-arm 判定結果（G1_23 / G1_29）だけを出力する（スクリプトから使う用）
@@ -21,10 +21,10 @@ import sys
 import time
 from pathlib import Path
 
+# Unitree G1 の既定構成。個体によって違うことがあるので「既定」と明記する。
 KNOWN_HOSTS = {
     161: "制御演算ユニット (既定)",
     164: "開発演算ユニット PC2 (既定)",
-    222: "このPC (ホスト)",
 }
 
 # unitree_hg の LowState_ モータ配列インデックス（robot_arm.py の JointIndex と一致）
@@ -64,6 +64,16 @@ def ng(msg):
     print(f"  \033[31m[NG]\033[0m   {msg}")
 
 
+def host_ipv4(iface):
+    """インターフェースに実際に付いている IPv4 アドレスを返す（無ければ None）。"""
+    out = subprocess.run(["ip", "-4", "-br", "addr", "show", iface],
+                         capture_output=True, text=True).stdout
+    for token in out.split():
+        if "/" in token and token.count(".") == 3:
+            return token.split("/")[0]
+    return None
+
+
 def check_link(iface):
     """有線リンクとホストIPを確認。リンクが上がっていれば True。"""
     section(f"1. 有線インターフェース {iface}")
@@ -83,7 +93,8 @@ def check_link(iface):
         ng("リンクが上がっていない。RJ45 の抜き差し / G1 の起動完了待ち。")
         return False
     if "192.168.123." not in addrs:
-        ng("静的IP 192.168.123.222/24 が付いていない。ネイティブ端末で:\n"
+        ng("192.168.123.x の静的IP が付いていない。docs/02-network.md の手順で設定する。\n"
+           "     NetworkManager 管理下なら nmcli で（ip addr add では消される）:\n"
            "       sudo nmcli con up 'Wired connection 1'\n"
            "     （`ip addr add` では NetworkManager に消されるので不可）")
         return False
@@ -92,7 +103,7 @@ def check_link(iface):
     return True
 
 
-def scan_subnet(iface, subnet):
+def scan_subnet(iface, subnet, self_ip=None):
     """/24 を並列 ping して生きているホストを列挙する（root 不要）。"""
     section(f"2. {subnet}.0/24 スキャン")
     print("  ping スイープ中 ... ", end="", flush=True)
@@ -120,12 +131,16 @@ def scan_subnet(iface, subnet):
         return []
 
     for i in found:
-        label = KNOWN_HOSTS.get(i, "\033[33m未知のホスト\033[0m")
+        if self_ip and f"{subnet}.{i}" == self_ip:
+            label = "このPC (ホスト)"
+        else:
+            label = KNOWN_HOSTS.get(i, "\033[33m未知のホスト\033[0m")
         mac = f"  mac={macs[i]}" if i in macs else ""
         mark = "ping応答" if i in alive else "ARPのみ"
         print(f"  {subnet}.{i:<4} {mark}  {label}{mac}")
 
-    robots = [i for i in found if i != 222]
+    self_last = int(self_ip.rsplit(".", 1)[1]) if self_ip else None
+    robots = [i for i in found if i != self_last]
     if 161 in robots:
         ok("制御演算ユニット .161 を確認（既定構成どおり）")
     elif robots:
@@ -208,7 +223,8 @@ def main():
     p.add_argument("--iface", default=None)
     p.add_argument("--print-arm", action="store_true",
                    help="判定結果だけを出力（スクリプトから呼ぶ用）")
-    p.add_argument("--subnet", default="192.168.123")
+    p.add_argument("--subnet", default=None,
+                   help="スキャンする /24（既定: 有線 NIC の実 IP から導出）")
     p.add_argument("--duration", type=float, default=3.0)
     p.add_argument("--skip-scan", action="store_true")
     args = p.parse_args()
@@ -227,8 +243,15 @@ def main():
 
     if not check_link(args.iface):
         sys.exit(1)
+
+    self_ip = host_ipv4(args.iface)
+    subnet = args.subnet
+    if subnet is None and self_ip:
+        subnet = self_ip.rsplit(".", 1)[0]   # 実測 IP から /24 を導く
+    subnet = subnet or "192.168.123"
+
     if not args.skip_scan:
-        scan_subnet(args.iface, args.subnet)
+        scan_subnet(args.iface, subnet, self_ip)
 
     arm = check_dds(args.iface, args.duration)
 

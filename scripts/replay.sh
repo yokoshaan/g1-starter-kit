@@ -6,6 +6,11 @@
 #   ./scripts/replay.sh <episode ディレクトリ>    # 指定した記録を dry-run
 #   ./scripts/replay.sh <episode> --execute      # ⚠️ 実機で再生する
 #
+# tools/replay_arm.py のオプションはそのまま渡せる（episode を先に書くこと）:
+#   ./scripts/replay.sh <episode> --source states --dof 29
+#   ./scripts/replay.sh <episode> --no-plot --save-plot /tmp/traj.png
+#   ./scripts/replay.sh <episode> -- --help      # -- 以降は無加工で渡す
+#
 # dry-run（既定）は DDS に何も送らず、軌道のグラフと送信予定値だけを見せる。
 # 実機で動かすときだけ --execute を付ける。必ず人が立ち会うこと。
 
@@ -45,12 +50,28 @@ for d in eps[:20]:
         print(f"  {d}   （読めません: {type(e).__name__}）")
 PY
       exit 0 ;;
-    --execute) EXECUTE=1 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
-    -*)        EXTRA+=("$1") ;;
-    *)         EPISODE="$1" ;;
+    --execute) EXECUTE=1; shift ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    --)        shift; EXTRA+=("$@"); break ;;
+    -*)
+      # このラッパーが知らないオプションは replay_arm.py へそのまま渡す。
+      # 値を取るもの（--source states など）は次の引数も一緒に渡す。
+      EXTRA+=("$1")
+      if [ $# -ge 2 ] && [ "${2#-}" = "$2" ] && [ -n "$EPISODE" ]; then
+        EXTRA+=("$2"); shift
+      fi
+      shift ;;
+    *)
+      if [ -n "$EPISODE" ]; then
+        _die "位置引数が複数あります（episode は 1 つだけ）:
+       1つ目: $EPISODE
+       2つ目: $1
+     episode ディレクトリは 1 つだけ指定してください。
+     オプションを無加工で渡したいときは -- を使ってください:
+       ./scripts/replay.sh <episode> -- <引数...>"
+      fi
+      EPISODE="$1"; shift ;;
   esac
-  shift
 done
 
 load_config

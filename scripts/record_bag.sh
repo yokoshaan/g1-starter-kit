@@ -8,7 +8,7 @@
 # 停止は Ctrl+C。保存先は bags/<名前>_<日時>/
 #
 # 記録した bag は次のように再生できる（RViz は lidar_view.sh のものを使う）:
-#   source scripts/lib.sh && use_ros && ros2 bag play bags/<dir>
+#   source scripts/lib.sh && load_config && use_ros && ros2 bag play bags/<dir>
 
 set -eo pipefail
 
@@ -68,4 +68,4 @@ ros2 bag record "${TOPICS[@]}" -o "$OUT"
 echo ""
 echo "記録終了: $OUT"
 du -sh "$OUT" 2>/dev/null || true
-echo "再生: source scripts/lib.sh && use_ros && ros2 bag play $OUT"
+echo "再生: source scripts/lib.sh && load_config && use_ros && ros2 bag play $OUT"

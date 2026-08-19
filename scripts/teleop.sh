@@ -37,7 +37,7 @@ require_wired
 
 TELEOP_DIR="$HOME/xr_teleoperate/teleop"
 [ -d "$TELEOP_DIR" ] || _die "xr_teleoperate が見つかりません: $TELEOP_DIR
-     setup/install_base.sh を実行してください。"
+     setup/install_env.sh を実行してください。"
 
 use_tv
 [ -n "$ARM" ] || ARM="$(resolve_arm)"

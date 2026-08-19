@@ -39,21 +39,32 @@ python3 tools/lidar_probe.py --write-config  # 検出結果から設定を生成
     シリアル   : ARMCPxxxxxxxxxx
     設定形式   : MID360s
 
-  config/g1.env に書く値:
-    G1_LIDAR_IP=192.168.123.120
-    G1_LIDAR_MODEL=MID360s
+  この機種の設定形式は MID360s です。
+  LiDAR のデータ送信先（このPC）: 192.168.123.222
+
+  --write-config を付けると config/livox/active.json を生成します
 ```
+
+LiDAR の IP と機種は `config/livox/active.json` に直接書かれるので、`config/g1.env`
+に転記する必要はありません。複数台つながっている場合は `--lidar-ip` か `--serial`
+で 1 台を指定してください（応答順で勝手に選ばないようにしてあります）。
 
 ### 仕組み
 
-Livox の LiDAR は接続先が確定していない間、UDP **56000** 番へ 2Hz 程度で「自分は誰か」をブロードキャストしています。`lidar_probe.py` はそれを読むだけで、LiDAR にもロボットにも書き込みません。
+Livox SDK2 と同じ手順です。ホストが UDP **56000** 番へ探索要求（`cmd_id=0x0000`）を
+1 秒間隔でブロードキャストし、LiDAR がそれに応答します。**LiDAR は自発的には名乗りません**。
+
+応答は CRC-16（先頭18バイト）と CRC-32（データ部）まで検証してから採用するので、
+無関係なパケットを機器情報と誤認することはありません。
+
+問い合わせるだけなので、LiDAR にもロボットにも一切書き込みません。
 
 ### 検出できないとき
 
 | 原因 | 対処 |
 |---|---|
 | **ドライバが起動中で 56000 を占有している** | 先に `lidar_view.sh` を止める |
-| **LiDAR が既に他ホストに接続済み**（ブロードキャストを止めている） | ロボットを再起動し、起動直後に実行する |
+| **LiDAR が既に他ホストに接続済み**（探索要求に応答しない） | ロボットを再起動し、起動直後に実行する |
 | 有線が繋がっていない / ロボットの起動が未完了 | `./scripts/preflight.sh` で確認 |
 | このPC が同じサブネットにいない | [02-network.md](02-network.md) の有線設定を確認 |
 
@@ -108,7 +119,7 @@ G1 の LiDAR は**上下逆さまに搭載されている**ことがあります
 
 ```bash
 ./scripts/lidar_view.sh --no-rviz &          # ドライバだけ起動
-python3 tools/lidar_probe.py --orientation
+python3 tools/lidar_probe.py --orientation   # ROS 環境を source した端末で
 ```
 
 ```

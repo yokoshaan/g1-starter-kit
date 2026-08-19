@@ -43,10 +43,7 @@ load_config() {
 
   : "${G1_WIRED_IFACE:=}"
   : "${G1_HOST_IP:=}"
-  : "${G1_CONTROL_IP:=192.168.123.161}"
   : "${G1_ARM:=auto}"
-  : "${G1_LIDAR_IP:=auto}"
-  : "${G1_LIDAR_MODEL:=auto}"
   : "${G1_LIDAR_FLIP:=true}"
   : "${G1_WIFI_IFACE:=}"
   : "${ROS_DOMAIN_ID:=42}"
@@ -104,7 +101,7 @@ use_ros() {
   unset PYTHONPATH CONDA_PREFIX CONDA_DEFAULT_ENV
 
   [ -f /opt/ros/humble/setup.bash ] \
-    || _die "ROS 2 Humble が見つかりません。setup/install_ros2.sh を実行してください。"
+    || _die "ROS 2 Humble が見つかりません。setup/install_apt.sh を実行してください。"
   # shellcheck disable=SC1091
   source /opt/ros/humble/setup.bash
 
@@ -123,11 +120,11 @@ use_ros() {
 use_tv() {
   local hook="$HOME/miniforge3/etc/profile.d/conda.sh"
   [ -f "$hook" ] || hook="$HOME/miniconda3/etc/profile.d/conda.sh"
-  [ -f "$hook" ] || _die "conda が見つかりません。setup/install_base.sh を実行してください。"
+  [ -f "$hook" ] || _die "conda が見つかりません。setup/install_env.sh を実行してください。"
   # shellcheck disable=SC1090
   source "$hook"
   conda activate tv 2>/dev/null \
-    || _die "conda 環境 'tv' がありません。setup/install_base.sh を実行してください。"
+    || _die "conda 環境 'tv' がありません。setup/install_env.sh を実行してください。"
   export CYCLONEDDS_HOME="$HOME/cyclonedds/install"
 }
 
