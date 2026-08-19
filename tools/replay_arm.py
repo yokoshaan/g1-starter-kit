@@ -88,13 +88,19 @@ N_BODY_JOINTS = 29                # 0..28 が実関節。29 は arm_sdk の weig
 # (30Hz で約 8 rad/s) 程度まで出るので、そこは通す。桁が違う値だけを弾く。
 WARN_STEP_RAD = 0.35      # これを超えたら警告（人の操作でも稀に出る）
 MAX_STEP_RAD = 1.0        # これを超えたら拒否（30Hz で 30 rad/s。記録の破損とみなす）
-STALE_STATE_SEC = 0.3     # lowstate がこの秒数途切れたら異常として停止
+# lowstate がこの秒数途切れたら通信断とみなして停止する。
+# 制御経路は有線（require_wired が 192.168.123.x を必須にする）で、実測 1000Hz 前後
+# 届くので、0.5 秒は約 500 メッセージ落ちに相当し検出としては十分に緩い。
+# それでも RViz や PlotJuggler と同時に動かすと GC や CPU 競合でコールバックが
+# 遅れることがあるため、余裕を持たせている。--state-timeout で変更可。
+STALE_STATE_SEC = 0.5
 ARG_RANGES = {            # 引数名: (下限, 上限)
     "frequency": (1.0, 200.0),
     "approach": (0.5, 60.0),
     "weight_ramp": (0.2, 30.0),
     "kp": (1.0, 200.0),
     "kd": (0.0, 20.0),
+    "state_timeout": (0.1, 5.0),
 }
 
 
@@ -287,7 +293,8 @@ def plot_trajectory(traj, joints, fps, save=None):
 class ArmReplayer:
     """arm_sdk 経由で腕だけを動かす。脚・ハンドには一切書き込まない。"""
 
-    def __init__(self, iface, joints, waist_joints, kp, kd, topic, gains_overridden=False):
+    def __init__(self, iface, joints, waist_joints, kp, kd, topic,
+                 gains_overridden=False, state_timeout=STALE_STATE_SEC):
         from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
@@ -297,6 +304,7 @@ class ArmReplayer:
         self.waist_joints = waist_joints
         self.kp, self.kd = kp, kd
         self.gains_overridden = gains_overridden
+        self.state_timeout = state_timeout
         self.crc = CRC()
         self.low_state = None
         self.last_state_at = None    # time.monotonic()。通信断の検出に使う
@@ -372,14 +380,14 @@ class ArmReplayer:
         """lowstate が途切れていないか。途切れたまま送信を続けると危険。"""
         if self.last_state_at is None:
             return True
-        return (time.monotonic() - self.last_state_at) > STALE_STATE_SEC
+        return (time.monotonic() - self.last_state_at) > self.state_timeout
 
     def check_alive(self):
         """通信が生きているかを確認し、切れていれば停止を要求する。"""
         if self.state_is_stale():
             self.abort.set()
             self.abort_reason = (
-                f"ロボットの状態（rt/lowstate）が {STALE_STATE_SEC} 秒以上途切れました。"
+                f"ロボットの状態（rt/lowstate）が {self.state_timeout} 秒以上途切れました。"
                 "ケーブル断・ロボット停止の可能性があります")
             return False
         return True
@@ -630,6 +638,28 @@ def current_motion_mode():
     return (result or {}).get("name", "") if isinstance(result, dict) else ""
 
 
+def watch_motion_mode(replayer, interval=1.0):
+    """再生中もモーションコントローラの状態を監視する（rt/lowcmd のときだけ）。
+
+    起動前に一度確認するだけでは、送信中にモーションコントローラが立ち上がった
+    ケースを検出できない。低レベル指令とロボット側の制御が同じモータを取り合うと
+    危険なので、変化を見つけたら即停止する。
+
+    ⚠️ この監視は実機で検証できていない（検証時にはモード変更を再現できなかった）。
+    """
+    while not replayer.abort.is_set():
+        time.sleep(interval)
+        if replayer.abort.is_set():
+            return
+        name = current_motion_mode()
+        if name:
+            replayer.abort.set()
+            replayer.abort_reason = (
+                f"再生中にモーションコントローラ '{name}' が起動しました。"
+                "低レベル指令と競合するため停止しました")
+            return
+
+
 def watch_for_enter(replayer):
     try:
         sys.stdin.readline()
@@ -663,6 +693,8 @@ def main():
                    help="指令トピック。auto（既定）は実機に問い合わせて選ぶ。"
                         "rt/arm_sdk はモーションコントローラ稼働時のみ有効。"
                         "rt/lowcmd は全身の低レベル指令（腕以外は現在角度でロックする）")
+    p.add_argument("--state-timeout", type=float, default=STALE_STATE_SEC,
+                   help=f"rt/lowstate がこの秒数途切れたら停止（既定 {STALE_STATE_SEC}）")
     p.add_argument("--force-lowcmd", action="store_true",
                    help="⚠️ モーションコントローラ稼働中でも rt/lowcmd を送る（非推奨）")
     p.add_argument("--kp", type=float, default=DEFAULT_KP)
@@ -726,6 +758,9 @@ def main():
     else:
         print(f"  ゲイン           : kp={args.kp} kd={args.kd}")
     print(f"  対象関節         : 腕 {len(joints)} 関節のみ（脚・ハンドには書き込みません）")
+    print(f"  通信断の検出     : rt/lowstate が {args.state_timeout} 秒途切れたら停止")
+    if topic == "rt/lowcmd":
+        print("  モード監視       : 再生中にモーションコントローラが起動したら停止")
     print(f"  腰               : {args.waist}")
     if args.waist == "none" and topic == "rt/arm_sdk":
         print("  ⚠️ --waist none と rt/arm_sdk の組み合わせでは、腰の指令が")
@@ -740,7 +775,8 @@ def main():
     waist_joints = WAIST_JOINTS_23 if dof == 23 else WAIST_JOINTS_29
     gains_overridden = (args.kp != DEFAULT_KP) or (args.kd != DEFAULT_KD)
     replayer = ArmReplayer(args.network_interface, joints, waist_joints,
-                           args.kp, args.kd, topic, gains_overridden)
+                           args.kp, args.kd, topic, gains_overridden,
+                           args.state_timeout)
 
     # Ctrl+C 以外（SIGTERM・端末切断）でも必ず終了処理を通す。
     # ここを外すと、送信途中でプロセスが消えて腕が指令のまま取り残される。
@@ -754,6 +790,8 @@ def main():
             pass
 
     threading.Thread(target=watch_for_enter, args=(replayer,), daemon=True).start()
+    if topic == "rt/lowcmd":
+        threading.Thread(target=watch_motion_mode, args=(replayer,), daemon=True).start()
 
     try:
         replayer.wait_for_state()
